@@ -41,4 +41,8 @@ jobs:
           gh release view italy > /dev/null 2>&1 || \
             gh release create italy --title "Italy" --notes "Street data for viision. © OpenStreetMap contributors, ODbL."
           gh release upload italy out/* --clobber
+          # Убираем старые файлы, которых в новой сборке нет (например, прежние файлы регионов).
+          for name in $(gh release view italy --json assets -q '.assets[].name'); do
+            [ -f "out/$name" ] || gh release delete-asset italy "$name" --yes
+          done
           gh release edit italy --title "Italy $(date -u +%Y-%m-%d)"

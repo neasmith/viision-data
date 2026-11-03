@@ -9,13 +9,16 @@
   IT               — код страны (тег ISO3166-1 у границы страны)
 
 Что получается в папке out:
-  <код>-index.json     — маленький общий файл: все области страны (страна, регионы, провинции,
-                         коммуны, кварталы), общая длина улиц в каждой, упрощённые контуры
-                         страны/регионов/провинций, имена файлов регионов.
-  region-<номер>.vpkg  — файл одного региона: точные границы его коммун и кварталов
-                         и улицы каждой коммуны. Его приложение качает по кнопке.
+  <код>-index.json       — маленький общий файл: все области страны (страна, регионы, провинции,
+                           коммуны, кварталы), общая длина улиц в каждой, упрощённые контуры
+                           страны/регионов/провинций, имена файлов провинций.
+  <код>-comuni.vpkg      — упрощённые (~50 м) границы всех коммун: по ним приложение видит,
+                           в каких коммунах ты был. Качается вместе с общим файлом.
+  province-<номер>.vpkg  — файл одной провинции: точные границы её коммун и кварталов
+                           и улицы каждой коммуны. Приложение качает его, когда добавляешь город.
+                           Где провинций нет (Валле-д'Аоста), такой файл делается на весь регион.
 
-Формат region-<номер>.vpkg (числа little-endian):
+Формат файлов .vpkg (числа little-endian):
   "VPKG", версия UInt32 (=1), число записей UInt32
   записи: вид UInt8 (0 — границы коммун и кварталов, 1 — улицы коммуны), номер Int64,
           начало UInt64, размер в файле UInt32, размер после распаковки UInt32
@@ -56,6 +59,7 @@ BAD_FOOTWAY = {"sidewalk", "crossing", "traffic_island"}
 BAD_ACCESS = {"private", "no", "customers", "emergency", "delivery", "permit"}
 LEVELS = {2, 4, 6, 8, 10}          # страна, регион, провинция, коммуна, квартал
 OUTLINE_TOLERANCE = 0.002          # градусы (~200 м): упрощение контуров в общем файле
+COMUNI_TOLERANCE = 0.0005          # градусы (~50 м): упрощение границ коммун в файле коммун
 KY = 6_371_000.0 * np.pi / 180     # метров в градусе широты — как в приложении
 
 
@@ -153,13 +157,18 @@ def build_hierarchy(areas, code):
     return country, regions, provinces, comuni, districts
 
 
-def areas_file(areas):
-    """Точные границы коммун и кварталов региона в формате VARE."""
+def areas_file(areas, tolerance=0.0):
+    """Границы областей в формате VARE: точные или упрощённые (tolerance в градусах)."""
     out = bytearray(b"VARE") + struct.pack("<II", 1, len(areas))
     for a in areas:
         raw = a["name"].encode("utf-8")
         rings = []
-        for polygon in shapely.get_parts(a["geom"]):
+        geom = a["geom"]
+        if tolerance > 0:
+            geom = shapely.simplify(geom, tolerance, preserve_topology=True)
+        for polygon in shapely.get_parts(geom):
+            if polygon.is_empty:
+                continue
             for ring in [polygon.exterior, *polygon.interiors]:
                 rings.append(np.asarray(ring.coords))
         out += struct.pack("<qqB", a["id"], a["parentID"] or 0, a["level"])
@@ -396,18 +405,34 @@ def main():
             area = by_id.get(area["parentID"])
         return area
 
-    log("writing region packages")
+    # Файл провинции: коммуны и кварталы, чей «хозяин» — эта провинция
+    # (или регион, если провинций нет, как в Валле-д'Аосте).
+    def owner_of(area):
+        while area and area["level"] not in (6, 4):
+            area = by_id.get(area["parentID"])
+        return area
+
+    log("writing province packages")
     packages = {}
-    for region in regions:
-        region_comuni = [c for c in comuni if region_of(c) is region]
-        region_districts = [d for d in districts if region_of(d) is region]
-        entries = [(0, region["id"], areas_file(region_comuni + region_districts))]
-        index_of = {id(c): k for k, c in enumerate(comuni)}
-        for c in region_comuni:
+    owners = {}
+    for c in comuni:
+        owners.setdefault(owner_of(c)["id"], []).append(c)
+    index_of = {id(c): k for k, c in enumerate(comuni)}
+    for owner_id, owner_comuni in owners.items():
+        owner_comuni_ids = {c["id"] for c in owner_comuni}
+        owner_districts = [d for d in districts if d["parentID"] in owner_comuni_ids]
+        entries = [(0, owner_id, areas_file(owner_comuni + owner_districts))]
+        for c in owner_comuni:
             entries.append((1, c["id"], streets_file(streets, per_comune[index_of[id(c)]])))
-        name = f"region-{region['id']}.vpkg"
-        packages[region["id"]] = (name, write_package(os.path.join(out_dir, name), entries))
-        log(f"{region['name']}: {len(region_comuni)} municipalities, {packages[region['id']][1] / 1e6:.1f} MB")
+        name = f"province-{owner_id}.vpkg"
+        packages[owner_id] = (name, write_package(os.path.join(out_dir, name), entries))
+        log(f"{by_id[owner_id]['name']}: {len(owner_comuni)} municipalities, {packages[owner_id][1] / 1e6:.1f} MB")
+
+    log("writing municipality outlines")
+    comuni_name = f"{code.lower()}-comuni.vpkg"
+    comuni_size = write_package(os.path.join(out_dir, comuni_name),
+                                [(0, country["id"], areas_file(comuni, COMUNI_TOLERANCE))])
+    log(f"{comuni_name}: {comuni_size / 1e6:.1f} MB")
 
     log("writing index")
     index_areas = []
@@ -417,11 +442,12 @@ def main():
                 "total": round(km, 1), "streets": named}
         if a["level"] in (2, 4, 6):
             item["outline"] = outline(a["geom"])
-        if a["level"] == 4:
+        if a["id"] in packages:
             item["package"], item["packageSize"] = packages[a["id"]]
         index_areas.append(item)
-    index = {"version": 1, "country": code, "name": country["name"],
-             "date": time.strftime("%Y-%m-%d", time.gmtime()), "areas": index_areas}
+    index = {"version": 2, "country": code, "name": country["name"],
+             "date": time.strftime("%Y-%m-%d", time.gmtime()),
+             "comuniFile": comuni_name, "comuniFileSize": comuni_size, "areas": index_areas}
     index_path = os.path.join(out_dir, f"{code.lower()}-index.json")
     with open(index_path, "w") as f:
         json.dump(index, f, separators=(",", ":"), ensure_ascii=False)
